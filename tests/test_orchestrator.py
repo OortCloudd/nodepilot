@@ -480,5 +480,32 @@ def test_reset_removes_state_file(tmp_path: Path) -> None:
     assert not Path(config.state_path).exists()
 
 
+def test_finished_jobs_release_their_process_handles(tmp_path: Path) -> None:
+    """Reaped jobs must not accumulate ``Popen`` handles (bounded memory).
+
+    The runner retains a handle per launched job to read its exit code; once a
+    job is reaped the handle is dropped. After the queue drains the retained-set
+    must be empty -- otherwise it would grow for the life of the scheduler.
+    """
+    queue_path = _write_queue(
+        tmp_path,
+        """
+        - id: ok
+          command: "true"
+          cores: 1
+          ram_gb: 1
+        - id: bad
+          command: "exit 5"
+          cores: 1
+          ram_gb: 1
+        """,
+    )
+    orch = Orchestrator.from_queue(str(queue_path))
+    orch.run(max_ticks=100)
+
+    assert all(j.is_terminal() for j in orch.jobs)
+    assert orch.runner._procs == {}, "finished jobs left dangling Popen handles"
+
+
 if __name__ == "__main__":  # pragma: no cover - allow ``python test_orchestrator.py``
     raise SystemExit(pytest.main([__file__, "-v"]))

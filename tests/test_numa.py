@@ -379,5 +379,64 @@ class TestDetect:
         assert parse_cpu_list(nodes[0]) == {0, 1}
 
 
+# ---------------------------------------------------------------------------
+# SMT awareness
+# ---------------------------------------------------------------------------
+class TestSmtAwareAllocation:
+    """``allocate`` prefers distinct physical cores over SMT sibling threads."""
+
+    # One node: physical cores 0-3, their SMT siblings 4-7.
+    NODE = {0: "0-7"}
+    SECONDARY = {4, 5, 6, 7}
+
+    def test_fits_in_physical_cores_uses_only_primaries(self) -> None:
+        placed = allocate(4, set(), self.NODE, smt_secondary=self.SECONDARY)
+        assert placed is not None
+        assert placed.cores() == {0, 1, 2, 3}  # distinct cores, not {0,4,1,5}
+        assert not placed.smt_oversubscribed
+
+    def test_partial_request_avoids_siblings(self) -> None:
+        placed = allocate(2, set(), self.NODE, smt_secondary=self.SECONDARY)
+        assert placed is not None
+        assert placed.cores().isdisjoint(self.SECONDARY)
+        assert not placed.smt_oversubscribed
+
+    def test_exceeding_physical_count_uses_siblings_and_flags_it(self) -> None:
+        placed = allocate(6, set(), self.NODE, smt_secondary=self.SECONDARY)
+        assert placed is not None
+        cores = placed.cores()
+        assert {0, 1, 2, 3}.issubset(cores)  # every physical core taken first
+        assert len(cores) == 6  # then two siblings
+        assert placed.smt_oversubscribed
+
+    def test_no_smt_info_is_unchanged(self) -> None:
+        default = allocate(4, set(), self.NODE)
+        explicit_empty = allocate(4, set(), self.NODE, smt_secondary=set())
+        assert default is not None and explicit_empty is not None
+        assert default.cores() == explicit_empty.cores() == {0, 1, 2, 3}
+        assert not default.smt_oversubscribed
+
+
+class TestDetectSmtSecondary:
+    def test_reads_sibling_groups(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # Fake sysfs: cores 0&2 are one physical core, 1&3 another.
+        root = tmp_path / "cpu"
+        for cpu, sibs in {0: "0,2", 1: "1,3", 2: "0,2", 3: "1,3"}.items():
+            topo = root / f"cpu{cpu}" / "topology"
+            topo.mkdir(parents=True)
+            (topo / "thread_siblings_list").write_text(sibs, encoding="ascii")
+        monkeypatch.setattr(numa, "_SYS_CPU", root)
+        # Primary = min of each group ({0,1}); the rest are secondary.
+        assert numa.detect_smt_secondary() == {2, 3}
+
+    def test_empty_without_sysfs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(numa, "_SYS_CPU", tmp_path / "absent")
+        assert numa.detect_smt_secondary() == set()
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

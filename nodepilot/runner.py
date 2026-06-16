@@ -175,6 +175,17 @@ class Runner:
             return _pid_alive(pid)
         return False
 
+    def _forget(self, job: Job) -> None:
+        """Drop the retained ``Popen`` handle for a finished job.
+
+        Once a job is reaped its exit status has already been read, so the
+        handle serves no further purpose; keeping it would grow ``_procs``
+        without bound over a long-lived run. No-op for tmux jobs and for
+        inherited jobs that have no handle.
+        """
+        if job.session.startswith("pid:"):
+            self._procs.pop(int(job.session[len("pid:") :]), None)
+
     def returncode(self, job: Job) -> int | None:
         """Exit status of a finished subprocess job, or ``None`` if unknown.
 
@@ -218,6 +229,7 @@ class Runner:
                     proc.wait(timeout=5)
                 except (subprocess.TimeoutExpired, OSError):
                     pass
+                self._procs.pop(pid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -265,17 +277,22 @@ def reap(job: Job, runner: Runner) -> Outcome:
     authoritative and never gates anything by itself.
     """
     exit_code = runner.returncode(job)
+    runner._forget(job)  # finished: drop the retained Popen handle
 
-    # An explicit OOM kill shows up as SIGKILL (137) and/or in the kernel log.
-    oom_hint = cgroups.journal_reports_oom(within_minutes=5)
-    if exit_code == 137 or (exit_code is None and oom_hint):
-        if oom_hint:
-            return Outcome("failed", "oom_killed", exit_code)
-        return Outcome("failed", "killed_signal", exit_code)
-
-    if exit_code is None:
-        # tmux backend with no recoverable status: assume success unless the
-        # kernel log flagged an OOM (handled above).
+    # Only an ambiguous death consults the kernel log: an OOM kill surfaces as
+    # SIGKILL/137, or (on the tmux backend) as an unrecoverable status. A clean
+    # or plainly non-zero exit is self-explanatory, so we skip the journalctl
+    # fork here -- which the original code ran on *every* reap, successes
+    # included.
+    if exit_code == 137 or exit_code is None:
+        oom_hint = cgroups.journal_reports_oom(within_minutes=5)
+        if exit_code == 137:
+            return Outcome(
+                "failed", "oom_killed" if oom_hint else "killed_signal", exit_code
+            )
+        if oom_hint:  # exit_code is None and the kernel log flagged an OOM
+            return Outcome("failed", "oom_killed", None)
+        # tmux backend with no recoverable status and no OOM hint: assume success.
         return Outcome("done", "", None)
 
     if exit_code == 0:

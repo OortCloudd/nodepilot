@@ -33,6 +33,7 @@ __all__ = [
     "parse_cpu_list",
     "format_cpu_list",
     "detect",
+    "detect_smt_secondary",
     "node_memory_gb",
     "Placement",
     "allocate",
@@ -41,6 +42,7 @@ __all__ = [
 ]
 
 _SYS_NODE = Path("/sys/devices/system/node")
+_SYS_CPU = Path("/sys/devices/system/cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +147,38 @@ def detect() -> dict[int, str]:
     return {0: format_cpu_list(cpus)}
 
 
+def detect_smt_secondary() -> set[int]:
+    """Return the *secondary* SMT thread ids on this machine.
+
+    For each physical core the kernel lists its hardware threads in
+    ``/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list``. The lowest
+    id in a sibling group is the *primary* (physical) thread; the rest are
+    *secondary* (SMT) threads. :func:`allocate` prefers primaries so a job gets
+    distinct physical cores until it genuinely needs more than the node has.
+
+    Returns an empty set when sysfs is unavailable (containers) or the machine
+    has no SMT, so callers degrade cleanly to "no SMT info".
+    """
+    secondary: set[int] = set()
+    if not _SYS_CPU.is_dir():
+        return secondary
+    seen: set[int] = set()
+    for child in _SYS_CPU.glob("cpu[0-9]*"):
+        sib_file = child / "topology" / "thread_siblings_list"
+        try:
+            group = parse_cpu_list(sib_file.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            continue
+        if not group:
+            continue
+        primary = min(group)
+        if primary in seen:
+            continue  # this sibling group was already accounted for
+        seen |= group
+        secondary |= group - {primary}
+    return secondary
+
+
 def node_memory_gb(node: int) -> tuple[float | None, float | None]:
     """Return ``(anon_used_gb, free_gb)`` for a NUMA node, or ``(None, None)``.
 
@@ -197,9 +231,13 @@ class Placement:
     contiguous
         Whether the chosen cores form a single contiguous run (informational;
         a non-contiguous fallback is still a valid placement).
+    smt_oversubscribed
+        True when the job requested more cores than the node has *distinct
+        physical* cores, so SMT sibling threads had to be included. The job then
+        does not get N independent cores; the orchestrator surfaces this.
     """
 
-    __slots__ = ("cpu_list", "node", "interleave", "contiguous")
+    __slots__ = ("cpu_list", "node", "interleave", "contiguous", "smt_oversubscribed")
 
     def __init__(
         self,
@@ -207,11 +245,13 @@ class Placement:
         node: int,
         interleave: bool = False,
         contiguous: bool = True,
+        smt_oversubscribed: bool = False,
     ) -> None:
         self.cpu_list = cpu_list
         self.node = node
         self.interleave = interleave
         self.contiguous = contiguous
+        self.smt_oversubscribed = smt_oversubscribed
 
     def cores(self) -> set[int]:
         """The set of physical core ids in this placement."""
@@ -245,6 +285,7 @@ def allocate(
     interleave_threshold_gb: float = 0.0,
     node_ram_cap_gb: float = 0.0,
     node_ram_safety_gb: float = 0.0,
+    smt_secondary: set[int] | None = None,
 ) -> Placement | None:
     """Find a NUMA-local block of ``n_cores`` free physical cores.
 
@@ -293,9 +334,10 @@ def allocate(
     )
     gate_ram = node_ram_cap_gb > 0 and not will_interleave
     safe_cap = node_ram_cap_gb - node_ram_safety_gb
+    secondary = smt_secondary or set()
 
-    candidates: list[tuple[bool, int, float, int, list[int]]] = []
-    # tuple = (not_contiguous, -free_count, node_used_gb, node, chosen_cores)
+    candidates: list[tuple[bool, int, float, int, list[int], bool]] = []
+    # tuple = (not_contiguous, -free_count, node_used_gb, node, cores, oversub)
     for node, spec in numa_nodes.items():
         node_cores = sorted(parse_cpu_list(spec))
         free = [c for c in node_cores if c not in occupied]
@@ -310,27 +352,43 @@ def allocate(
                 if used_gb + ram_gb > safe_cap:
                     continue  # node would be over-committed; skip it
 
-        start = _largest_contiguous_run(free, n_cores)
-        if start is not None:
-            chosen = list(range(start, start + n_cores))
-            contiguous = True
+        # Draw from distinct *physical* cores (primary SMT threads) first, and
+        # only fall back to sibling threads when the job needs more cores than
+        # the node has physical ones -- otherwise a job could silently get two
+        # threads of one core instead of two separate cores. With no SMT info
+        # (``secondary`` empty) ``primaries == free`` and this is a no-op.
+        primaries = [c for c in free if c not in secondary]
+        siblings = [c for c in free if c in secondary]
+        oversub = len(primaries) < n_cores
+
+        if not oversub:
+            start = _largest_contiguous_run(primaries, n_cores)
+            if start is not None:
+                chosen = list(range(start, start + n_cores))
+                contiguous = True
+            else:
+                chosen = primaries[:n_cores]
+                contiguous = False
         else:
-            chosen = free[:n_cores]
+            # More cores requested than physical cores on the node: take every
+            # physical core, then fill the remainder with sibling threads.
+            chosen = primaries + siblings[: n_cores - len(primaries)]
             contiguous = False
         candidates.append(
-            (not contiguous, -len(free), used_gb, node, chosen)
+            (not contiguous, -len(free), used_gb, node, chosen, oversub)
         )
 
     if not candidates:
         return None
 
     candidates.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
-    not_contig, _neg_free, _used, node, chosen = candidates[0]
+    not_contig, _neg_free, _used, node, chosen, oversub = candidates[0]
     return Placement(
         format_cpu_list(chosen),
         node,
         interleave=will_interleave,
         contiguous=not not_contig,
+        smt_oversubscribed=oversub,
     )
 
 

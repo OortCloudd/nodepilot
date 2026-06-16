@@ -55,6 +55,9 @@ class Orchestrator:
         self.runner = runner.Runner(config)
         self._numa_nodes = config.numa_nodes_resolved
         self._reserved = numa.parse_cpu_list(config.reserved_cores)
+        # SMT sibling threads, so the allocator can prefer distinct physical
+        # cores; empty on hosts without SMT info (no effect there).
+        self._smt_secondary = numa.detect_smt_secondary()
 
     # -- construction ----------------------------------------------------
     @classmethod
@@ -204,6 +207,7 @@ class Orchestrator:
             numa_nodes=self._numa_nodes,
             ram_gb=job.ram_gb,
             interleave_threshold_gb=self.config.interleave_threshold_gb,
+            smt_secondary=self._smt_secondary,
         )
         if placement is None:
             # No NUMA-local block free right now; retry next tick.
@@ -214,6 +218,14 @@ class Orchestrator:
 
         job.cpu_list = placement.cpu_list
         job.numa_node = placement.node
+        if placement.smt_oversubscribed:
+            # The job asked for more cores than the node has physical ones, so
+            # some assigned ids are SMT siblings sharing a core -- not N
+            # independent cores. Surface it rather than letting it pass silently.
+            self.log.warning(
+                "smt oversubscribed %s",
+                kv(job=job.id, cores=job.cores, cpu=job.cpu_list, node=job.numa_node),
+            )
         argv = runner.build_command(job, placement, self.config)
         try:
             self.runner.start(job, argv)
