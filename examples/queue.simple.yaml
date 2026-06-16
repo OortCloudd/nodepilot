@@ -1,0 +1,93 @@
+# nodepilot -- minimal "does it work?" queue
+# ==========================================
+# Copy-paste smoke test. Every command here is harmless (echo / sleep), so you
+# can run it on any machine -- laptop, container, CI -- to confirm the install,
+# the scheduling loop, dependencies, and priority ordering all work, before you
+# point nodepilot at a real workload.
+#
+# Run it:
+#     nodepilot run    examples/queue.simple.yaml
+#     nodepilot status examples/queue.simple.yaml
+#     nodepilot reset  examples/queue.simple.yaml   # start over from scratch
+#
+# Expected behaviour: 'setup' runs first (lowest priority number), then 'fast'
+# and 'slow' run concurrently, and 'report' waits until 'setup' has finished
+# (depends_on) before it starts. Total wall time is a few seconds.
+
+# --- global: scheduler tunables (each key maps 1:1 to a Config field) --------
+global:
+  # Run at most this many jobs at once. Two of the jobs below overlap, so a
+  # cap of 2+ lets you see real concurrency; lower it to 1 to watch them
+  # serialise.
+  max_concurrent: 3
+
+  # Total physical cores the scheduler may hand out across running jobs. Small
+  # on purpose so this example fits a modest machine. Omit to default to the
+  # host's core count.
+  core_budget: 4
+
+  # Total RAM (GiB) the scheduler may commit across running jobs -- a
+  # declarative pre-check. These toy jobs barely use memory; the budget just
+  # has to cover the sum of their `ram_gb` requests. Omit to default to ~85%
+  # of host RAM.
+  ram_budget_gb: 8
+
+  # cgroups v2 containment is nodepilot's real OOM guard, but it needs a
+  # systemd user/system slice to exist. Setting it to '' DISABLES cgroup
+  # wrapping and uses declarative RAM accounting only -- so this example runs
+  # anywhere, with no slice setup and no root. For production, set this to a
+  # real slice (default: 'nodepilot.slice') whose MemoryMax sits below
+  # physical RAM.
+  memory_slice: ''
+
+  # How each command is executed:
+  #   subprocess -- detached child (default; nothing extra to install)
+  #   tmux       -- one tmux session per job you can `tmux attach` to
+  runner: subprocess
+
+  # Seconds between scheduler ticks. Short here so the demo finishes promptly;
+  # 10-30s is fine for long scientific jobs.
+  poll_interval: 2
+
+  # Where progress is snapshotted (resume on restart) and logged. Kept local to
+  # this folder so the example leaves no trace elsewhere; `nodepilot reset`
+  # removes the state file.
+  state_path: ./nodepilot_state.json
+  log_path: ./nodepilot.log
+
+  # numa_nodes is intentionally omitted: nodepilot auto-detects the machine's
+  # NUMA topology from sysfs (and falls back to a single synthetic node on a
+  # laptop/container). To pin explicitly you would write, e.g.:
+  #   numa_nodes: {0: "0-15", 1: "16-31"}
+
+# --- jobs: the work queue ----------------------------------------------------
+# Only `id` and `command` are required per job; every other field has a default.
+jobs:
+  # Runs first: lowest `priority` number wins (priority is "nice-like" -- LOWER
+  # runs first). Other jobs default to priority 100.
+  - id: setup
+    command: "echo '[setup] preparing inputs' && sleep 2 && echo '[setup] done'"
+    cores: 1
+    ram_gb: 1
+    priority: 10
+
+  # A quick job at the default priority (100). Shares the box with `slow`.
+  - id: fast
+    command: "echo '[fast] hello from nodepilot' && sleep 1"
+    cores: 1
+    ram_gb: 1
+
+  # A longer job to demonstrate concurrency: while it sleeps, `fast` (and later
+  # `report`) can run alongside it, up to `max_concurrent` / `core_budget`.
+  - id: slow
+    command: "echo '[slow] working...' && sleep 5 && echo '[slow] finished'"
+    cores: 2
+    ram_gb: 2
+
+  # Dependency demo: `report` stays pending until `setup` reaches 'done'. Its
+  # cores/RAM are only reserved once it actually launches.
+  - id: report
+    command: "echo '[report] all upstream work complete -- writing summary'"
+    cores: 1
+    ram_gb: 1
+    depends_on: [setup]

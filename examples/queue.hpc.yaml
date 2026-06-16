@@ -1,0 +1,206 @@
+# =============================================================================
+# nodepilot -- example HPC queue (runnable-safe placeholders)
+# =============================================================================
+#
+# This file is a *demonstration* of the full feature set on a single fat node:
+# resource requests (cores / ram_gb / maxcore / nprocs), a dependency DAG, an
+# exclusive memory-bound phase, NUMA-aware placement with SMT exclusion, and
+# cgroup v2 memory containment under a systemd slice.
+#
+# It is deliberately SAFE TO RUN AS-IS. Every `command:` below is a harmless
+# placeholder built from `sleep`, `echo`, and `hostname` -- nothing here starts
+# a real solver. The real invocations (ORCA / CP2K / VASP / Gaussian / PyTorch)
+# are shown only in comments next to each job, so nobody launches a multi-hour
+# computation by accident just by trying the example.
+#
+#   ---------------------------------------------------------------------------
+#   >>> TO USE FOR REAL WORK:
+#       Replace each placeholder `command:` with your actual solver invocation
+#       (see the commented `# real:` line under each job), point `workdir:` at
+#       your case directory, and adjust `cores` / `ram_gb` / `nprocs` to match.
+#       The optional `stress-ng` line under a couple of jobs is a heavier (but
+#       still synthetic) load generator -- uncomment ONLY if `stress-ng` is
+#       installed and you actually want to exercise CPU/RAM.
+#   ---------------------------------------------------------------------------
+#
+# Run it:
+#     nodepilot run    examples/queue.hpc.yaml
+#     nodepilot status examples/queue.hpc.yaml
+#     nodepilot kill   examples/queue.hpc.yaml <job-id>
+#     nodepilot reset  examples/queue.hpc.yaml      # discard saved state
+#
+# The DAG modelled below:
+#
+#     prep ──┬──> scf-converge ──> property-analysis ──┐
+#            │                                          ├──> collect-results
+#            └──> md-equilibrate ─> md-production* ─────┘
+#                                   (* exclusive: runs alone)
+#
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# global: scheduler tunables (every key maps 1:1 to nodepilot.config.Config)
+# -----------------------------------------------------------------------------
+global:
+  # At most this many jobs run at once, regardless of free cores/RAM. A blunt
+  # ceiling is the most reliable guard against an over-subscription cascade.
+  max_concurrent: 3
+
+  # Resource budgets the scheduler may hand out. Leave commented to auto-derive
+  # from the host (core_budget = detected cores; ram_budget_gb = 85% of total).
+  # Shown here with explicit values sized for a ~32-core / 256 GB example box.
+  core_budget: 30          # keep a couple of cores for the OS / the scheduler
+  ram_budget_gb: 220       # declarative pre-check; the cgroup slice is the real guard
+  ram_safety_gb: 20        # never plan RAM use within this margin of the cap
+
+  # --- NUMA topology --------------------------------------------------------
+  # Map each NUMA node to its *physical* core range. Each job is pinned to a
+  # contiguous block on ONE node (numactl --physcpubind --membind) so its
+  # threads and memory stay socket-local. Omit this block entirely to let
+  # nodepilot auto-detect the topology from /sys at startup.
+  #
+  # Example: a 2-socket box, 16 physical cores per socket, SMT on (siblings are
+  # the high-numbered logical CPUs 32-63, excluded via reserved_cores below).
+  numa_nodes:
+    0: "0-15"
+    1: "16-31"
+
+  # Cores never handed to any job. Here: the SMT sibling lane (32-63) so jobs
+  # only ever land on physical cores, plus nothing else reserved. Adjust to
+  # your `lscpu -e` layout. Empty string = reserve nothing.
+  reserved_cores: "32-63"
+
+  # Once a single job's ram_gb reaches this, spread its pages across all nodes
+  # (numactl --interleave=all) instead of binding to one node -- stops one big
+  # job from saturating a single node's memory while the other sits free.
+  interleave_threshold_gb: 96
+
+  # --- OOM safety (cgroups v2) ---------------------------------------------
+  # Every job runs in a transient systemd scope under this slice, with a hard
+  # MemoryMax. The slice's own memory.current is the source of truth for
+  # committed RAM. Set memory_slice to "" to disable containment and fall back
+  # to purely declarative accounting (e.g. on a host without cgroup v2).
+  #
+  # Create/cap the slice once before running, e.g.:
+  #     systemctl --user set-property nodepilot.slice MemoryMax=230G MemorySwapMax=0
+  memory_slice: "nodepilot.slice"
+  orchestrator_oom_score_adj: -800   # protect the scheduler from the OOM killer
+  job_oom_score_adj: 500             # sacrifice jobs first under memory pressure
+  oom_cooldown_seconds: 300          # after an OOM, freeze launches this long
+
+  # --- execution & paths ----------------------------------------------------
+  runner: "subprocess"               # or "tmux" for an attachable session per job
+  poll_interval: 5                   # seconds between scheduler ticks
+  state_path: "./nodepilot_state.json"
+  log_path: "./nodepilot.log"
+  pause_file: "./.nodepilot.pause"   # `touch` this to freeze new launches
+
+
+# -----------------------------------------------------------------------------
+# jobs: the work queue. `id` + `command` are the only required fields per job;
+# everything else has a sensible default. Lower `priority` runs first.
+# -----------------------------------------------------------------------------
+jobs:
+
+  # --- 1) prep: cheap single-core setup step, runs first --------------------
+  - id: prep
+    # real: python prepare_inputs.py --case ./case01
+    command: "echo '[prep] staging inputs' && sleep 5 && echo '[prep] done'"
+    cores: 1
+    ram_gb: 2
+    priority: 10               # lowest number -> scheduled first
+    workdir: "."
+    metadata:
+      stage: setup             # free-form tags; ignored by the scheduler
+
+  # --- 2) scf-converge: MPI compute step, depends on prep -------------------
+  # Demonstrates nprocs (MPI ranks) + maxcore (per-rank memory hint in MiB).
+  # Admission's sanity rule wants ram_gb >= maxcore * nprocs * 1.3 / 1024,
+  # i.e. 3000 * 8 * 1.3 / 1024 ~= 30.5 GB <= 32 GB requested. OK.
+  - id: scf-converge
+    # real (ORCA):  $ORCA/orca scf.inp > scf.out         # %pal nprocs 8; %maxcore 3000
+    # real (CP2K):  mpirun -np 8 cp2k.psmp -i scf.inp -o scf.out
+    command: "echo '[scf] iterating' && sleep 20 && echo '[scf] converged'"
+    cores: 8
+    nprocs: 8                  # one MPI rank per core
+    maxcore: 3000              # MiB per rank (mirrors a solver's %maxcore knob)
+    ram_gb: 32
+    depends_on: [prep]
+    priority: 20
+    workdir: "."
+    env:
+      # nodepilot's MPI helpers can also inject these; shown here to make the
+      # "outer numactl owns all placement" intent explicit and self-documenting.
+      OMP_NUM_THREADS: "1"
+    metadata:
+      stage: compute
+
+  # --- 3) property-analysis: post-processing, depends on the SCF step -------
+  # Heavier per-rank memory (maxcore 4000 * 8 * 1.3 / 1024 ~= 40.6 GB <= 48 GB).
+  - id: property-analysis
+    # real (ORCA):  $ORCA/orca props.inp > props.out
+    # real (Gaussian): g16 < props.gjf > props.log
+    command: "echo '[prop] analysing' && sleep 15 && echo '[prop] report written'"
+    cores: 8
+    nprocs: 8
+    maxcore: 4000
+    ram_gb: 48
+    depends_on: [scf-converge]
+    priority: 30
+    workdir: "."
+    # Heavier synthetic load alternative (requires stress-ng); leave commented:
+    #   command: "stress-ng --cpu 8 --vm 1 --vm-bytes 8G --timeout 15s"
+    metadata:
+      stage: postprocess
+
+  # --- 4) md-equilibrate: independent branch, can run beside the SCF branch -
+  - id: md-equilibrate
+    # real (VASP):  mpirun -np 8 vasp_std        # in an equilibration INCAR dir
+    # real (CP2K):  mpirun -np 8 cp2k.psmp -i eq.inp -o eq.out
+    command: "echo '[md-eq] warming up' && sleep 18 && echo '[md-eq] equilibrated'"
+    cores: 8
+    nprocs: 8
+    maxcore: 2000              # 2000 * 8 * 1.3 / 1024 ~= 20.3 GB <= 24 GB
+    ram_gb: 24
+    depends_on: [prep]
+    priority: 25
+    workdir: "."
+    metadata:
+      stage: md
+
+  # --- 5) md-production: the memory-bound phase -> EXCLUSIVE -----------------
+  # A large, bandwidth/RAM-hungry run that hates company. `exclusive: true`
+  # means admission lets it start ONLY when nothing else is running, and blocks
+  # every other launch while it runs -- the queue serialises around it.
+  # Its ram_gb (128) is above interleave_threshold_gb (96), so nodepilot will
+  # place it with `numactl --interleave=all` instead of binding one node.
+  - id: md-production
+    # real (VASP):  mpirun -np 16 vasp_std       # production INCAR, large cell
+    # real (PyTorch): torchrun --nproc_per_node=2 train.py --bf16   # 2 GPUs + CPU feeders
+    command: "echo '[md-prod] EXCLUSIVE run start' && sleep 30 && echo '[md-prod] trajectory done'"
+    cores: 16
+    nprocs: 16
+    maxcore: 6000              # 6000 * 16 * 1.3 / 1024 ~= 122 GB <= 128 GB
+    ram_gb: 128
+    exclusive: true            # runs alone; serialises the whole queue
+    depends_on: [md-equilibrate]
+    priority: 40
+    workdir: "."
+    # Heavier synthetic load alternative (requires stress-ng); leave commented:
+    #   command: "stress-ng --cpu 16 --vm 2 --vm-bytes 32G --timeout 30s"
+    metadata:
+      stage: md
+      note: memory-bound
+
+  # --- 6) collect-results: fan-in barrier, waits on both branches -----------
+  - id: collect-results
+    # real: python collect.py --scf scf.out --prop props.out --md traj.dcd
+    command: "echo '[collect] gathering outputs' && sleep 5 && echo '[collect] all done -> results/'"
+    cores: 1
+    ram_gb: 2
+    depends_on: [property-analysis, md-production]
+    priority: 50
+    workdir: "."
+    metadata:
+      stage: collect

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nodepilot"
+version = "0.1.0"  # keep in sync with nodepilot.__version__
+description = "Single-node, OOM-safe HPC job orchestrator: YAML queue + cgroups v2 containment + NUMA pinning, without SLURM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OortCloudd" }]
+keywords = [
+    "hpc",
+    "numa",
+    "cgroups",
+    "scheduler",
+    "orchestrator",
+    "oom",
+    "slurm-free",
+    "single-node",
+    "job-queue",
+    "workstation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+
+# Runtime deps: PyYAML only. Everything else (RAM via /proc/meminfo, cores via
+# sysfs/sched_getaffinity, cgroup accounting via /sys/fs/cgroup) is read from
+# the kernel directly with the standard library -- no psutil, by design.
+dependencies = [
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+nodepilot = "nodepilot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/OortCloudd/nodepilot"
+Source = "https://github.com/OortCloudd/nodepilot"
+Issues = "https://github.com/OortCloudd/nodepilot/issues"
+
+[tool.setuptools]
+# Src-less layout: the import package lives at ./nodepilot next to this file.
+packages = ["nodepilot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

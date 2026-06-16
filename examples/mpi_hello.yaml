@@ -1,0 +1,78 @@
+# mpi_hello.yaml -- MPI per-rank binding, demonstrated with a harmless payload.
+#
+# Run:    nodepilot run examples/mpi_hello.yaml
+# Status: nodepilot status examples/mpi_hello.yaml
+#
+# WHAT THIS SHOWS
+# ---------------
+# A single MPI job that exercises nodepilot's MPI placement path. The payload is
+# deliberately trivial -- `hostname`, printed once per rank -- so there is no
+# science and nothing to install beyond an MPI launcher. Swap `hostname` for a
+# real solver (ORCA / CP2K / VASP / Gaussian, etc.) and the binding story below
+# is unchanged.
+#
+# THE BINDING STORY (why `--bind-to none --map-by node`)
+# ------------------------------------------------------
+# nodepilot pins each job from the OUTSIDE: before your command runs it is
+# wrapped in `numactl --physcpubind=<cores> --membind=<node>` so both the CPUs
+# and the first-touch memory pages stay on one NUMA node (see nodepilot/numa.py
+# :: placement_prefix). The trap is that an MPI launcher has its OWN affinity
+# logic and will, by default, override that outer cpuset -- scattering ranks
+# across sockets and landing their memory on a REMOTE node. Once those pages are
+# allocated they stay remote for the life of the job: a 1.5-1.8x latency tax,
+# plus the risk of a single-node OOM while the other socket sits idle.
+#
+# The cure is to tell the launcher to keep its hands off and let nodepilot's
+# numactl own all placement:
+#   --bind-to none   -> the launcher binds nothing (defers to the parent cpuset)
+#   --map-by  node   -> ranks are distributed by NUMA node, so memory stays local
+#
+# These two flags are exactly what nodepilot.mpi.openmpi_no_bind_flags() returns:
+#   >>> from nodepilot.mpi import openmpi_no_bind_flags
+#   >>> openmpi_no_bind_flags()
+#   ['--bind-to', 'none', '--map-by', 'node']
+# (Open MPI flavour. For the MCA-environment-variable equivalent -- useful when
+# you cannot edit the mpirun line -- see openmpi_no_bind_env(), and merge it into
+# the job's `env:` block below.)
+#
+# A NOTE ON THE COMMAND
+# ---------------------
+# There is no `python -m nodepilot.mpi` helper CLI in this version, so the flags
+# are written out inline rather than interpolated. If such a helper is ever
+# added, the idiom would read:
+#       command: "mpirun $(python -m nodepilot.mpi no-bind-flags) -np 4 hostname"
+# Until then, keep the literal flags in sync with openmpi_no_bind_flags().
+#
+# `nprocs: 4` tells nodepilot this job spawns 4 MPI ranks (it drives the
+# maxcore sanity check and the per-rank binding plan); `cores: 4` reserves a
+# contiguous 4-core block on one socket for them -- one core per rank.
+#
+# REQUIREMENTS / FALLBACK
+# -----------------------
+# This needs an Open-MPI-style `mpirun` on PATH. If `mpirun` is absent the job
+# will fail fast (nonzero exit, classified `exit_N`) and this file is then
+# DOCUMENTATION ONLY -- it still parses and `nodepilot status` works, you just
+# will not see ranks run. To smoke-test the orchestrator itself without MPI,
+# use examples that run `sleep`/`echo`/`hostname` directly.
+
+global:
+  max_concurrent: 1
+  # Keep the whole demo on a small, explicit topology so it is reproducible on a
+  # laptop. Two synthetic "nodes"; nodepilot will place the 4-core block on one
+  # of them and membind there. Delete this block to auto-detect real NUMA nodes.
+  numa_nodes:
+    0: "0-3"
+    1: "4-7"
+  state_path: ./mpi_hello_state.json
+  log_path: ./mpi_hello.log
+
+jobs:
+  - id: mpi-hello
+    # `--bind-to none --map-by node` == nodepilot.mpi.openmpi_no_bind_flags():
+    # let nodepilot's outer numactl own placement so ranks and their memory stay
+    # on one socket (no cross-socket DRAM spill). `hostname` is the harmless
+    # per-rank payload -- replace with your real MPI solver as-is.
+    command: "mpirun --bind-to none --map-by node -np 4 hostname"
+    nprocs: 4
+    cores: 4
+    ram_gb: 4
